@@ -97,8 +97,8 @@ use log::LevelFilter;
 use serde::de::{self, Deserialize as SerdeDeserialize, DeserializeOwned};
 use serde_value::Value;
 use thiserror::Error;
-use typemap_ors::{Key, ShareCloneMap};
-
+use std::any::TypeId;
+use std::sync::Mutex;
 use crate::{append::AppenderConfig, config};
 
 #[allow(unused_imports)]
@@ -162,15 +162,22 @@ where
     }
 }
 
-struct KeyAdaptor<T: ?Sized>(PhantomData<T>);
+// Type-erased map key for storing type information
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct TypeKey(TypeId);
 
-impl<T: ?Sized + 'static> Key for KeyAdaptor<T> {
-    type Value = HashMap<String, Arc<dyn ErasedDeserialize<Trait = T>>>;
+impl TypeKey {
+    fn new<T: ?Sized + 'static>() -> Self {
+        TypeKey(TypeId::of::<T>())
+    }
 }
 
 /// A container of `Deserialize`rs.
 #[derive(Clone)]
-pub struct Deserializers(ShareCloneMap);
+pub struct Deserializers {
+    // Map from type ID to a map of string -> deserializer
+    deserializers: Arc<Mutex<HashMap<TypeKey, Box<dyn std::any::Any + Send + Sync>>>>,
+}
 
 impl Default for Deserializers {
     fn default() -> Deserializers {
@@ -279,7 +286,9 @@ impl Deserializers {
 
     /// Creates a new `Deserializers` with no mappings.
     pub fn empty() -> Deserializers {
-        Deserializers(ShareCloneMap::custom())
+        Deserializers {
+            deserializers: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// Adds a mapping from the specified `kind` to a deserializer.
@@ -287,10 +296,24 @@ impl Deserializers {
     where
         T: Deserialize,
     {
-        self.0
-            .entry::<KeyAdaptor<T::Trait>>()
-            .or_insert_with(HashMap::new)
-            .insert(kind.to_owned(), Arc::new(DeserializeEraser(deserializer)));
+        let key = TypeKey::new::<T::Trait>();
+        let mut deserializers = self.deserializers.lock().unwrap();
+
+        // Get or create the map for this type
+        let type_map = deserializers
+            .entry(key)
+            .or_insert_with(|| {
+                Box::new(HashMap::<String, Arc<dyn ErasedDeserialize<Trait = T::Trait>>>::new())
+                    as Box<dyn std::any::Any + Send + Sync>
+            });
+
+        // Downcast to get the actual map
+        let type_map = type_map
+            .downcast_mut::<HashMap<String, Arc<dyn ErasedDeserialize<Trait = T::Trait>>>>()
+            .unwrap();
+
+        // Insert the deserializer
+        type_map.insert(kind.to_owned(), Arc::new(DeserializeEraser(deserializer)));
     }
 
     /// Deserializes a value of a specific type and kind.
@@ -298,8 +321,27 @@ impl Deserializers {
     where
         T: Deserializable + ?Sized,
     {
-        match self.0.get::<KeyAdaptor<T>>().and_then(|m| m.get(kind)) {
-            Some(b) => b.deserialize(config, self),
+        let deserializers = self.deserializers.lock().unwrap();
+        let key = TypeKey::new::<T>();
+
+        // Get the map for this type if it exists
+        match deserializers.get(&key) {
+            Some(type_map) => {
+                // Downcast to get the actual map
+                let type_map = type_map
+                    .downcast_ref::<HashMap<String, Arc<dyn ErasedDeserialize<Trait = T>>>>()
+                    .unwrap();
+
+                // Get the deserializer for this kind if it exists
+                match type_map.get(kind) {
+                    Some(deserializer) => deserializer.deserialize(config, self),
+                    None => Err(anyhow!(
+                        "no {} deserializer for kind `{}` registered",
+                        T::name(),
+                        kind
+                    )),
+                }
+            }
             None => Err(anyhow!(
                 "no {} deserializer for kind `{}` registered",
                 T::name(),
