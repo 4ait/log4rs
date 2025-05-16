@@ -321,27 +321,29 @@ impl Deserializers {
     where
         T: Deserializable + ?Sized,
     {
-        let deserializers = self.deserializers.lock().unwrap();
-        let key = TypeKey::new::<T>();
+        // Find the deserializer first, while holding the lock
+        let deserializer = {
+            let deserializers = self.deserializers.lock().unwrap();
+            let key = TypeKey::new::<T>();
 
-        // Get the map for this type if it exists
-        match deserializers.get(&key) {
-            Some(type_map) => {
-                // Downcast to get the actual map
-                let type_map = type_map
-                    .downcast_ref::<HashMap<String, Arc<dyn ErasedDeserialize<Trait = T>>>>()
-                    .unwrap();
+            // Get the map for this type if it exists
+            match deserializers.get(&key) {
+                Some(type_map) => {
+                    // Downcast to get the actual map
+                    let type_map = type_map
+                        .downcast_ref::<HashMap<String, Arc<dyn ErasedDeserialize<Trait = T>>>>()
+                        .unwrap();
 
-                // Get the deserializer for this kind if it exists
-                match type_map.get(kind) {
-                    Some(deserializer) => deserializer.deserialize(config, self),
-                    None => Err(anyhow!(
-                        "no {} deserializer for kind `{}` registered",
-                        T::name(),
-                        kind
-                    )),
+                    // Clone the deserializer reference so we can drop the lock before using it
+                    type_map.get(kind).map(|d| d.clone())
                 }
+                None => None,
             }
+        }; // Lock is released here
+
+        // Now use the deserializer without holding the lock
+        match deserializer {
+            Some(deserializer) => deserializer.deserialize(config, self),
             None => Err(anyhow!(
                 "no {} deserializer for kind `{}` registered",
                 T::name(),
@@ -424,14 +426,26 @@ impl RawConfig {
 
         for (name, appender) in &self.appenders {
             let mut builder = config::Appender::builder();
+
+            // Process filters - clone name before entering the loop to avoid borrowing issues
+            let name_clone = name.clone();
             for filter in &appender.filters {
-                match deserializers.deserialize(&filter.kind, filter.config.clone()) {
+                let filter_kind = filter.kind.clone();
+                let filter_config = filter.config.clone();
+
+                match deserializers.deserialize(&filter_kind, filter_config) {
                     Ok(filter) => builder = builder.filter(filter),
-                    Err(e) => errors.push(DeserializingConfigError::Filter(name.clone(), e)),
+                    Err(e) => errors.push(DeserializingConfigError::Filter(name_clone.clone(), e)),
                 }
             }
-            match deserializers.deserialize(&appender.kind, appender.config.clone()) {
-                Ok(appender) => appenders.push(builder.build(name.clone(), appender)),
+
+            // Process appender - again using clones to avoid borrow issues
+            let appender_kind = appender.kind.clone();
+            let appender_config = appender.config.clone();
+            let name_for_appender = name.clone();
+
+            match deserializers.deserialize(&appender_kind, appender_config) {
+                Ok(appender) => appenders.push(builder.build(name_for_appender, appender)),
                 Err(e) => errors.push(DeserializingConfigError::Appender(name.clone(), e)),
             }
         }
